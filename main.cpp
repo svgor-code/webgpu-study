@@ -14,6 +14,26 @@ using namespace wgpu;
 const uint32_t kWidth = 512;
 const uint32_t kHeight = 512;
 
+const char* shaderSource = R"(
+@vertex
+fn vs_main(@builtin(vertex_index) in_vertex_index: u32) -> @builtin(position) vec4f {
+    var p = vec2f(0.0, 0.0);
+    if (in_vertex_index == 0u) {
+        p = vec2f(-0.5, -0.5);
+    } else if (in_vertex_index == 1u) {
+        p = vec2f(0.5, -0.5);
+    } else {
+        p = vec2f(0.0, 0.5);
+    }
+    return vec4f(p, 0.0, 1.0);
+}
+
+@fragment
+fn fs_main() -> @location(0) vec4f {
+    return vec4f(0.0, 0.4, 1.0, 1.0);
+}
+)";
+
 struct UserData {
   Device device;
 };
@@ -92,6 +112,8 @@ class Application {
   // Return true as long as the main loop should keep on running
   bool IsRunning();
 
+ private:
+  void InitializePipeline();
   TextureView GetNextSurfaceTextureView();
 
  private:
@@ -102,6 +124,8 @@ class Application {
   Surface surface;
   Instance instance;
   UncapturedErrorCallback<> uncapturedErrorCallbackHandle;
+  TextureFormat surfaceFormat = TextureFormat::Undefined;
+  RenderPipeline pipeline;
 };
 
 int main() {
@@ -150,13 +174,14 @@ bool Application::Initialize() {
   queue = device.GetQueue();
   SurfaceCapabilities surfaceCapabilities;
   surface.GetCapabilities(adapter, &surfaceCapabilities);
+  surfaceFormat = surfaceCapabilities.formats[0];
 
   SurfaceConfiguration config = {};
 
   config.width = 640;
   config.height = 480;
   config.usage = TextureUsage::RenderAttachment;
-  config.format = surfaceCapabilities.formats[0];
+  config.format = surfaceFormat;
   config.viewFormatCount = 0;
   config.viewFormats = nullptr;
   config.device = device;
@@ -167,15 +192,13 @@ bool Application::Initialize() {
 
   std::cout << "Initialized" << " - surface " << surface.Get() << std::endl;
 
+  InitializePipeline();
+
   return true;
 }
 
 void Application::MainLoop() {
-  Application app;
-
   glfwPollEvents();
-
-  std::cout << "surface - " << surface.Get() << std::endl;
 
   TextureView targetView = GetNextSurfaceTextureView();
   if (!targetView) return;
@@ -200,15 +223,19 @@ void Application::MainLoop() {
   renderPassDesc.timestampWrites = nullptr;
 
   RenderPassEncoder renderPass = encoder.BeginRenderPass(&renderPassDesc);
+
+  // Select which render pipeline to use
+  renderPass.SetPipeline(pipeline);
+  // Draw 1 instance of a 3-vertices shape
+  renderPass.Draw(3, 1, 0, 0);
+
   renderPass.End();
 
   CommandBufferDescriptor cmdBufferDescriptor = {};
   cmdBufferDescriptor.label = "Command buffer";
   CommandBuffer command = encoder.Finish(&cmdBufferDescriptor);
 
-  std::cout << "Submitting command..." << std::endl;
   queue.Submit(1, &command);
-  std::cout << "Command submitted." << std::endl;
 
   surface.Present();
   device.Tick();
@@ -220,6 +247,66 @@ void Application::Terminate() {
   surface.Unconfigure();
   glfwDestroyWindow(window);
   glfwTerminate();
+}
+
+void Application::InitializePipeline() {
+  ShaderModuleDescriptor shaderDesc;
+  ShaderSourceWGSL shaderSourceWGSL;
+
+  shaderSourceWGSL.code = shaderSource;
+  // Connect the chain
+  shaderDesc.nextInChain = &shaderSourceWGSL;
+#ifdef WEBGPU_BACKEND_WGPU
+  shaderDesc.hintCount = 0;
+  shaderDesc.hints = nullptr;
+#endif
+  ShaderModule shaderModule = device.CreateShaderModule(&shaderDesc);
+
+  RenderPipelineDescriptor pipelineDesc;
+  pipelineDesc.layout = nullptr;
+
+  pipelineDesc.vertex.bufferCount = 0;
+  pipelineDesc.vertex.buffers = nullptr;
+  pipelineDesc.vertex.module = shaderModule;
+  pipelineDesc.vertex.entryPoint = "vs_main";
+  pipelineDesc.vertex.constantCount = 0;
+  pipelineDesc.vertex.constants = nullptr;
+
+  pipelineDesc.primitive.topology = PrimitiveTopology::TriangleList;
+  pipelineDesc.primitive.stripIndexFormat = IndexFormat::Undefined;
+  pipelineDesc.primitive.frontFace = FrontFace::CCW;
+  pipelineDesc.primitive.cullMode = CullMode::None;
+
+  pipelineDesc.depthStencil = nullptr;
+
+  pipelineDesc.multisample.count = 1;
+  pipelineDesc.multisample.mask = ~0u;
+  pipelineDesc.multisample.alphaToCoverageEnabled = false;
+
+  BlendState blendState;
+  blendState.color.srcFactor = BlendFactor::SrcAlpha;
+  blendState.color.dstFactor = BlendFactor::OneMinusSrcAlpha;
+  blendState.color.operation = BlendOperation::Add;
+  blendState.alpha.srcFactor = BlendFactor::Zero;
+  blendState.alpha.dstFactor = BlendFactor::One;
+  blendState.alpha.operation = BlendOperation::Add;
+
+  ColorTargetState colorTarget;
+  colorTarget.format = surfaceFormat;
+  colorTarget.blend = &blendState;
+  colorTarget.writeMask = ColorWriteMask::All;
+
+  FragmentState fragmentState;
+  fragmentState.module = shaderModule;
+  fragmentState.entryPoint = "fs_main";
+  fragmentState.constantCount = 0;
+  fragmentState.constants = nullptr;
+  fragmentState.targetCount = 1;
+  fragmentState.targets = &colorTarget;
+
+  pipelineDesc.fragment = &fragmentState;
+
+  pipeline = device.CreateRenderPipeline(&pipelineDesc);
 }
 
 TextureView Application::GetNextSurfaceTextureView() {
