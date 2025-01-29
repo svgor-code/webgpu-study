@@ -16,21 +16,13 @@ const uint32_t kHeight = 512;
 
 const char* shaderSource = R"(
 @vertex
-fn vs_main(@builtin(vertex_index) in_vertex_index: u32) -> @builtin(position) vec4f {
-    var p = vec2f(0.0, 0.0);
-    if (in_vertex_index == 0u) {
-        p = vec2f(-0.5, -0.5);
-    } else if (in_vertex_index == 1u) {
-        p = vec2f(0.5, -0.5);
-    } else {
-        p = vec2f(0.0, 0.5);
-    }
-    return vec4f(p, 0.0, 1.0);
+fn vs_main(@location(0) in_vertex_position: vec2f) -> @builtin(position) vec4f {
+	return vec4f(in_vertex_position, 0.0, 1.0);
 }
 
 @fragment
 fn fs_main() -> @location(0) vec4f {
-    return vec4f(0.0, 0.4, 1.0, 1.0);
+	return vec4f(0.0, 0.4, 1.0, 1.0);
 }
 )";
 
@@ -79,10 +71,37 @@ Adapter requestAdapterSync(Instance instance,
   return userData.adapter;
 }
 
-void requestDeviceSync(Instance instance, Adapter adapter, Device* device) {
+Device requestDeviceSync(Instance instance, Adapter adapter) {
+  struct RequestDeviceUserData {
+    Device device;
+    bool processFinished;
+  };
+  RequestDeviceUserData userData;
+
   auto onDeviceRequest = [](RequestDeviceStatus status, Device _device,
                             StringView message,
-                            Device* device) { *device = _device; };
+                            RequestDeviceUserData* userData) {
+    userData->device = _device;
+    SupportedLimits supportedLimits;
+    _device.GetLimits(&supportedLimits);
+
+    std::cout << supportedLimits.limits.maxBufferSize << std::endl;
+  };
+
+  SupportedLimits supportedLimits;
+  adapter.GetLimits(&supportedLimits);
+
+  RequiredLimits requiredLimits;
+
+  requiredLimits.limits.maxVertexAttributes = 1;
+  requiredLimits.limits.maxVertexBuffers = 1;
+  requiredLimits.limits.maxBufferSize = 6 * 2 * sizeof(float);
+  requiredLimits.limits.maxVertexBufferArrayStride = 2 * sizeof(float);
+
+  requiredLimits.limits.minUniformBufferOffsetAlignment =
+      supportedLimits.limits.minUniformBufferOffsetAlignment;
+  requiredLimits.limits.minStorageBufferOffsetAlignment =
+      supportedLimits.limits.minStorageBufferOffsetAlignment;
 
   DeviceDescriptor deviceDesc = {};
   deviceDesc.nextInChain = nullptr;
@@ -91,33 +110,33 @@ void requestDeviceSync(Instance instance, Adapter adapter, Device* device) {
   deviceDesc.requiredLimits = nullptr;
   deviceDesc.defaultQueue.nextInChain = nullptr;
   deviceDesc.defaultQueue.label = "The default queue";
+  deviceDesc.requiredLimits = &requiredLimits;
+
+  std::cout << "required: " << requiredLimits.limits.maxBufferSize << std::endl;
 
   Future futureRequestDevice = adapter.RequestDevice(
-      &deviceDesc, CallbackMode::WaitAnyOnly, onDeviceRequest, device);
+      &deviceDesc, CallbackMode::WaitAnyOnly, onDeviceRequest, &userData);
 
   instance.WaitAny(futureRequestDevice, 0);
+
+  return userData.device;
 }
 
 class Application {
  public:
-  // Initialize everything and return true if it went all right
   bool Initialize();
-
-  // Uninitialize everything that was initialized
   void Terminate();
-
-  // Draw a frame and handle events
   void MainLoop();
-
-  // Return true as long as the main loop should keep on running
   bool IsRunning();
 
  private:
   void InitializePipeline();
   TextureView GetNextSurfaceTextureView();
+  void PlayingWithBuffers();
+  RequiredLimits GetRequiredLimits(Adapter adapter) const;
+  void InitializeBuffers();
 
  private:
-  // We put here all the variables that are shared between init and main loop
   GLFWwindow* window;
   Device device;
   Queue queue;
@@ -126,6 +145,8 @@ class Application {
   UncapturedErrorCallback<> uncapturedErrorCallbackHandle;
   TextureFormat surfaceFormat = TextureFormat::Undefined;
   RenderPipeline pipeline;
+  Buffer vertexBuffer;
+  uint32_t vertexCount;
 };
 
 int main() {
@@ -166,10 +187,12 @@ bool Application::Initialize() {
   }
 
   RequestAdapterOptions adapterOpts = {};
-  // adapterOpts.compatibleSurface = &tempSurface;
-
   Adapter adapter = requestAdapterSync(instance, &adapterOpts);
-  requestDeviceSync(instance, adapter, &device);
+
+  SupportedLimits supportedLimits;
+  RequiredLimits requiredLimits = GetRequiredLimits(adapter);
+
+  device = requestDeviceSync(instance, adapter);
 
   queue = device.GetQueue();
   SurfaceCapabilities surfaceCapabilities;
@@ -178,8 +201,8 @@ bool Application::Initialize() {
 
   SurfaceConfiguration config = {};
 
-  config.width = 640;
-  config.height = 480;
+  config.width = kWidth;
+  config.height = kHeight;
   config.usage = TextureUsage::RenderAttachment;
   config.format = surfaceFormat;
   config.viewFormatCount = 0;
@@ -192,7 +215,10 @@ bool Application::Initialize() {
 
   std::cout << "Initialized" << " - surface " << surface.Get() << std::endl;
 
+  InitializeBuffers();
   InitializePipeline();
+
+  // PlayingWithBuffers();
 
   return true;
 }
@@ -226,9 +252,9 @@ void Application::MainLoop() {
 
   // Select which render pipeline to use
   renderPass.SetPipeline(pipeline);
+  renderPass.SetVertexBuffer(0, vertexBuffer, 0, vertexBuffer.GetSize());
   // Draw 1 instance of a 3-vertices shape
-  renderPass.Draw(3, 1, 0, 0);
-
+  renderPass.Draw(vertexCount, 1, 0, 0);
   renderPass.End();
 
   CommandBufferDescriptor cmdBufferDescriptor = {};
@@ -265,8 +291,20 @@ void Application::InitializePipeline() {
   RenderPipelineDescriptor pipelineDesc;
   pipelineDesc.layout = nullptr;
 
-  pipelineDesc.vertex.bufferCount = 0;
-  pipelineDesc.vertex.buffers = nullptr;
+  VertexBufferLayout vertexBufferLayout;
+  VertexAttribute positionAttrib;
+
+  positionAttrib.shaderLocation = 0;
+  positionAttrib.format = VertexFormat::Float32x2;
+  positionAttrib.offset = 0;
+
+  vertexBufferLayout.attributeCount = 1;
+  vertexBufferLayout.attributes = &positionAttrib;
+  vertexBufferLayout.arrayStride = 2 * sizeof(float);
+  vertexBufferLayout.stepMode = VertexStepMode::Vertex;
+
+  pipelineDesc.vertex.bufferCount = 1;
+  pipelineDesc.vertex.buffers = &vertexBufferLayout;
   pipelineDesc.vertex.module = shaderModule;
   pipelineDesc.vertex.entryPoint = "vs_main";
   pipelineDesc.vertex.constantCount = 0;
@@ -339,4 +377,115 @@ TextureView Application::GetNextSurfaceTextureView() {
   TextureView targetView = texture.CreateView(&viewDescriptor);
 
   return targetView;
+}
+
+void Application::InitializeBuffers() {
+  std::vector<float> vertexData = {// x0, y0
+                                   -0.5, -0.5,
+
+                                   // x1, y1
+                                   +0.5, -0.5,
+
+                                   // x2, y2
+                                   +0.0, +0.5,
+
+                                   // x0, y0
+                                   -0.55f, -0.5,
+
+                                   // x1, y1
+                                   -0.05f, +0.5,
+
+                                   // x2, y2
+                                   -0.55f, +0.5};
+
+  vertexCount = static_cast<uint32_t>(vertexData.size() / 2);
+
+  BufferDescriptor bufferDesc;
+  bufferDesc.size = vertexData.size() * sizeof(float);
+  bufferDesc.usage =
+      BufferUsage::CopyDst | BufferUsage::Vertex;  // Vertex usage here!
+  bufferDesc.mappedAtCreation = false;
+  vertexBuffer = device.CreateBuffer(&bufferDesc);
+
+  // Upload geometry data to the buffer
+  queue.WriteBuffer(vertexBuffer, 0, vertexData.data(), bufferDesc.size);
+}
+
+void Application::PlayingWithBuffers() {
+  BufferDescriptor bufferDesc;
+  bufferDesc.label = "Some GPU-side data buffer";
+  bufferDesc.usage = BufferUsage::CopyDst | BufferUsage::CopySrc;
+  bufferDesc.size = 16;
+  bufferDesc.mappedAtCreation = false;
+  Buffer buffer1 = device.CreateBuffer(&bufferDesc);
+
+  bufferDesc.label = "Output buffer";
+  bufferDesc.usage = BufferUsage::CopyDst | BufferUsage::MapRead;
+  Buffer buffer2 = device.CreateBuffer(&bufferDesc);
+
+  int bufferSize = 16;
+
+  std::vector<uint8_t> numbers(bufferSize);
+  for (uint8_t i = 0; i < bufferSize; ++i) numbers[i] = i;
+  // Copy this from `numbers` (RAM) to `buffer1` (VRAM)
+  queue.WriteBuffer(buffer1, 0, numbers.data(), numbers.size());
+
+  CommandEncoder encoder = device.CreateCommandEncoder(nullptr);
+  encoder.CopyBufferToBuffer(buffer1, 0, buffer2, 0, bufferSize);
+
+  CommandBuffer command = encoder.Finish(nullptr);
+  queue.Submit(1, &command);
+
+  struct Context {
+    Buffer buffer;
+  };
+
+  Context context = {buffer2};
+
+  auto onBuffer2Mapped = [](MapAsyncStatus status, StringView message,
+                            void* pUserData) {
+    std::cout << "Buffer 2 mapped with status "
+              << std::to_string(status == MapAsyncStatus::Success) << std::endl;
+
+    if (status != MapAsyncStatus::Success) {
+      return;
+    }
+
+    Context* context = reinterpret_cast<Context*>(pUserData);
+    uint8_t* bufferData = (uint8_t*)context->buffer.GetConstMappedRange(0, 16);
+
+    std::cout << "bufferData = [";
+    for (int i = 0; i < 16; ++i) {
+      if (i > 0) std::cout << ", ";
+      std::cout << (int)bufferData[i];
+    }
+    std::cout << "]" << std::endl;
+
+    context->buffer.Unmap();
+  };
+
+  Future futureMapping = buffer2.MapAsync(MapMode::Read, 0, numbers.size(),
+                                          CallbackMode::WaitAnyOnly,
+                                          onBuffer2Mapped, (void*)&context);
+
+  instance.WaitAny(futureMapping, 0);
+}
+
+RequiredLimits Application::GetRequiredLimits(Adapter adapter) const {
+  SupportedLimits supportedLimits;
+  adapter.GetLimits(&supportedLimits);
+
+  RequiredLimits requiredLimits;
+
+  requiredLimits.limits.maxVertexAttributes = 1;
+  requiredLimits.limits.maxVertexBuffers = 1;
+  requiredLimits.limits.maxBufferSize = 6 * 2 * sizeof(float);
+  requiredLimits.limits.maxVertexBufferArrayStride = 2 * sizeof(float);
+
+  requiredLimits.limits.minUniformBufferOffsetAlignment =
+      supportedLimits.limits.minUniformBufferOffsetAlignment;
+  requiredLimits.limits.minStorageBufferOffsetAlignment =
+      supportedLimits.limits.minStorageBufferOffsetAlignment;
+
+  return requiredLimits;
 }
