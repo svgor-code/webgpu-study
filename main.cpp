@@ -15,14 +15,27 @@ const uint32_t kWidth = 512;
 const uint32_t kHeight = 512;
 
 const char* shaderSource = R"(
+struct VertexInput {
+  @location(0) position: vec2f,
+  @location(1) color: vec3f,
+};
+
+struct VertexOutput {
+  @builtin(position) position: vec4f,
+  @location(0) color: vec3f,
+}
+
 @vertex
-fn vs_main(@location(0) in_vertex_position: vec2f) -> @builtin(position) vec4f {
-	return vec4f(in_vertex_position, 0.0, 1.0);
+fn vs_main(in: VertexInput) -> VertexOutput {
+  var out: VertexOutput;
+  out.position = vec4f(in.position, 0.0, 1.0);
+  out.color = in.color;
+	return out;
 }
 
 @fragment
-fn fs_main() -> @location(0) vec4f {
-	return vec4f(0.0, 0.4, 1.0, 1.0);
+fn fs_main(in: VertexOutput) -> @location(0) vec4f {
+	return vec4f(in.color, 1.0);
 }
 )";
 
@@ -145,8 +158,9 @@ class Application {
   UncapturedErrorCallback<> uncapturedErrorCallbackHandle;
   TextureFormat surfaceFormat = TextureFormat::Undefined;
   RenderPipeline pipeline;
-  Buffer vertexBuffer;
-  uint32_t vertexCount;
+  Buffer positionBuffer;
+  Buffer indexBuffer;
+  uint32_t indexCount;
 };
 
 int main() {
@@ -240,7 +254,7 @@ void Application::MainLoop() {
   renderPassColorAttachment.resolveTarget = nullptr;
   renderPassColorAttachment.loadOp = LoadOp::Clear;
   renderPassColorAttachment.storeOp = StoreOp::Store;
-  Color color = {0.9, 0.1, 0.2, 1.0};
+  Color color = {0.05, 0.05, 0.05, 1.0};
   renderPassColorAttachment.clearValue = color;
   renderPassColorAttachment.depthSlice = WGPU_DEPTH_SLICE_UNDEFINED;
   renderPassDesc.colorAttachmentCount = 1;
@@ -252,9 +266,10 @@ void Application::MainLoop() {
 
   // Select which render pipeline to use
   renderPass.SetPipeline(pipeline);
-  renderPass.SetVertexBuffer(0, vertexBuffer, 0, vertexBuffer.GetSize());
+  renderPass.SetVertexBuffer(0, positionBuffer, 0, positionBuffer.GetSize());
+  renderPass.SetIndexBuffer(indexBuffer, IndexFormat::Uint16, 0, indexBuffer.GetSize());
   // Draw 1 instance of a 3-vertices shape
-  renderPass.Draw(vertexCount, 1, 0, 0);
+  renderPass.DrawIndexed(indexCount, 1, 0, 0, 0);
   renderPass.End();
 
   CommandBufferDescriptor cmdBufferDescriptor = {};
@@ -292,25 +307,34 @@ void Application::InitializePipeline() {
   pipelineDesc.layout = nullptr;
 
   VertexBufferLayout vertexBufferLayout;
-  VertexAttribute positionAttrib;
+	// We now have 2 attributes
+	std::vector<VertexAttribute> vertexAttribs(2);
+	
+	// Describe the position attribute
+	vertexAttribs[0].shaderLocation = 0; // @location(0)
+	vertexAttribs[0].format = VertexFormat::Float32x2;
+	vertexAttribs[0].offset = 0;
 
-  positionAttrib.shaderLocation = 0;
-  positionAttrib.format = VertexFormat::Float32x2;
-  positionAttrib.offset = 0;
+	// Describe the color attribute
+	vertexAttribs[1].shaderLocation = 1; // @location(1)
+	vertexAttribs[1].format = VertexFormat::Float32x3; // different type!
+	vertexAttribs[1].offset = 2 * sizeof(float); // non null offset!
+	
+	vertexBufferLayout.attributeCount = static_cast<uint32_t>(vertexAttribs.size());
+	vertexBufferLayout.attributes = vertexAttribs.data();
+	vertexBufferLayout.arrayStride = 5 * sizeof(float);
+	//                               ^^^^^^^^^^^^^^^^^ The new stride
+	vertexBufferLayout.stepMode = VertexStepMode::Vertex;
+	
+	pipelineDesc.vertex.bufferCount = 1;
+	pipelineDesc.vertex.buffers = &vertexBufferLayout;
 
-  vertexBufferLayout.attributeCount = 1;
-  vertexBufferLayout.attributes = &positionAttrib;
-  vertexBufferLayout.arrayStride = 2 * sizeof(float);
-  vertexBufferLayout.stepMode = VertexStepMode::Vertex;
-
-  pipelineDesc.vertex.bufferCount = 1;
-  pipelineDesc.vertex.buffers = &vertexBufferLayout;
   pipelineDesc.vertex.module = shaderModule;
   pipelineDesc.vertex.entryPoint = "vs_main";
   pipelineDesc.vertex.constantCount = 0;
   pipelineDesc.vertex.constants = nullptr;
 
-  pipelineDesc.primitive.topology = PrimitiveTopology::TriangleList;
+  pipelineDesc.primitive.topology = PrimitiveTopology::LineList;
   pipelineDesc.primitive.stripIndexFormat = IndexFormat::Undefined;
   pipelineDesc.primitive.frontFace = FrontFace::CCW;
   pipelineDesc.primitive.cullMode = CullMode::None;
@@ -380,35 +404,49 @@ TextureView Application::GetNextSurfaceTextureView() {
 }
 
 void Application::InitializeBuffers() {
-  std::vector<float> vertexData = {// x0, y0
-                                   -0.5, -0.5,
+  std::vector<float> pointData = {
+    // x,   y,     r,   g,   b
+    -0.5, -0.5,   1.0, 0.0, 0.0,
+    +0.5, -0.5,   0.0, 1.0, 0.0,
+    +0.5, +0.5,   0.0, 0.0, 1.0,
+    -0.5, +0.5,   1.0, 1.0, 0.0
+  };
 
-                                   // x1, y1
-                                   +0.5, -0.5,
+  std::vector<uint16_t> indexData = {
+    0, 1, 2, // Triangle #0 connects points #0, #1 and #2
+    0, 2, 3  // Triangle #1 connects points #0, #2 and #3
+  };
 
-                                   // x2, y2
-                                   +0.0, +0.5,
+  // r0,  g0,  b0, r1,  g1,  b1, ...
+  // std::vector<float> colorData = {
+  //   1.0, 0.0, 0.0,
+  //   0.0, 1.0, 0.0,
+  //   0.0, 0.0, 1.0,
 
-                                   // x0, y0
-                                   -0.55f, -0.5,
+  //   1.0, 1.0, 0.0,
+  //   1.0, 0.0, 1.0,
+  //   0.0, 1.0, 1.0
+  // };
 
-                                   // x1, y1
-                                   -0.05f, +0.5,
-
-                                   // x2, y2
-                                   -0.55f, +0.5};
-
-  vertexCount = static_cast<uint32_t>(vertexData.size() / 2);
+  indexCount = static_cast<uint32_t>(indexData.size());
+  // assert(vertexCount == static_cast<uint32_t>(colorData.size() / 3));
 
   BufferDescriptor bufferDesc;
-  bufferDesc.size = vertexData.size() * sizeof(float);
-  bufferDesc.usage =
-      BufferUsage::CopyDst | BufferUsage::Vertex;  // Vertex usage here!
+  bufferDesc.size = pointData.size() * sizeof(float);
+  bufferDesc.usage = BufferUsage::CopyDst | BufferUsage::Vertex;
   bufferDesc.mappedAtCreation = false;
-  vertexBuffer = device.CreateBuffer(&bufferDesc);
+  bufferDesc.label = "Vertex Position";
 
-  // Upload geometry data to the buffer
-  queue.WriteBuffer(vertexBuffer, 0, vertexData.data(), bufferDesc.size);
+  positionBuffer = device.CreateBuffer(&bufferDesc);
+  queue.WriteBuffer(positionBuffer, 0, pointData.data(), bufferDesc.size);
+
+  bufferDesc.size = indexData.size() * sizeof(uint16_t);
+  bufferDesc.size = (bufferDesc.size + 3) & ~3;
+  bufferDesc.label = "Index";
+  bufferDesc.usage = BufferUsage::CopyDst | BufferUsage::Index;
+
+  indexBuffer = device.CreateBuffer(&bufferDesc);
+  queue.WriteBuffer(indexBuffer, 0, indexData.data(), bufferDesc.size);
 }
 
 void Application::PlayingWithBuffers() {
